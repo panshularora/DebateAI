@@ -3,6 +3,7 @@ package debate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -22,6 +23,25 @@ type PollMetadata struct {
 	Question string   `json:"question"`
 	Options  []string `json:"options"`
 }
+
+// ErrInvalidPollOption is returned when a vote targets an option that is not
+// defined on the poll (or the poll does not exist).
+var ErrInvalidPollOption = errors.New("invalid poll option")
+
+// voteScript atomically validates the option, records the voter and increments
+// the count. HINCRBY would otherwise create arbitrary new options, so the option
+// must already exist in the counts hash initialised by CreatePoll.
+// Returns 1 on success, 0 on duplicate vote, -1 on invalid option.
+var voteScript = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[1], ARGV[1]) == 0 then
+	return -1
+end
+if redis.call("SADD", KEYS[2], ARGV[2]) == 0 then
+	return 0
+end
+redis.call("HINCRBY", KEYS[1], ARGV[1], 1)
+return 1
+`)
 
 // NewPollStore creates a new PollStore instance
 func NewPollStore() *PollStore {
@@ -107,25 +127,20 @@ func (ps *PollStore) Vote(debateID, pollID, option, spectatorHash string) (bool,
 	votersKey := fmt.Sprintf("debate:%s:poll:%s:voters", debateID, pollID)
 	countsKey := fmt.Sprintf("debate:%s:poll:%s:counts", debateID, pollID)
 
-	// Check if spectator already voted (using SET)
-	added, err := ps.rdb.SAdd(ps.ctx, votersKey, spectatorHash).Result()
+	res, err := voteScript.Run(ps.ctx, ps.rdb, []string{countsKey, votersKey}, option, spectatorHash).Int64()
 	if err != nil {
-		return false, fmt.Errorf("failed to add voter: %w", err)
+		return false, fmt.Errorf("failed to record vote: %w", err)
 	}
 
-	if added == 0 {
+	switch res {
+	case 1:
+		return true, nil
+	case 0:
 		// Duplicate vote
 		return false, nil
+	default:
+		return false, ErrInvalidPollOption
 	}
-
-	// Increment poll count atomically
-	if err := ps.rdb.HIncrBy(ps.ctx, countsKey, option, 1).Err(); err != nil {
-		// Rollback voter add
-		ps.rdb.SRem(ps.ctx, votersKey, spectatorHash)
-		return false, fmt.Errorf("failed to increment count: %w", err)
-	}
-
-	return true, nil
 }
 
 // GetPollState returns the current poll state for all polls in a debate
